@@ -1,0 +1,12 @@
+*.out
+*.log
+*.auto.*
+.DS_Store
+package-lock.json
+node_modules
+.vscode
+dist/**
+autosrc.json
+*/config/**
+*/cert/**
+*/letsencrypt/**
