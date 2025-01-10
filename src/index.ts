@@ -77,12 +77,18 @@ class SourceGenerator {
   }
 
   private async generateInitialManifest() {
-    console.log(`Generating initial manifest`);
+    process.stdout.write(`Generating initial manifest\n`);
     const message = `Given this project specification:
 ${JSON.stringify(this.specContent, null, 2)}
 
-Please predict the project structure and create a manifest of all files that will need to be generated.
-The manifest should be a JSON array of objects with this format:
+Make a plan of all of the changes you will need to perform in order to create  a completely correct project according to the specification.
+Your plan should be a list of instructions:
+
+ADD : if you need to a new file to the project, then queue an ADD command with format: { add: { path: 'path of file to be added', description: 'description of the file to be added' } }
+- If in order to comlpete the project, you need to generate or update a file already listed as generated in the manifest, then queue an UPDATE command with format: { update: { path: 'path of file to be added', content: 'contents of generated file', why: 'reason why file is being updated' } }
+- If in order to comlpete the project, you need to remove a file already in the manifest, then queue a REMOVE command with format: { remove: { path: 'path of file to be added' } }
+- If in order to comlpete the project, you determine there are absolutely no more files to be added, updated, or removed, then queue a FINISH command with format: { finish: 'final report once no more files need to be added, updated, or removed' }
+
 {
   "path": "relative path to the file",
   "description": "description of the file's purpose",
@@ -116,11 +122,11 @@ Respond with only the JSON array.`;
   }
 
   private async processCommands(commands: Command[]) {
-    console.log(`Received ${commands.length} commands from Claude`);
+    process.stdout.write(`Received ${commands.length} commands from Claude\n`);
     for (const command of commands) {
       if ('add' in command) {
         const { path, description } = command.add;
-        console.log(`ADD ${path}`);
+        process.stdout.write(`ADD ${path}\n`);
         this.manifest.files.push({
           path,
           description,
@@ -129,7 +135,7 @@ Respond with only the JSON array.`;
         await this.saveManifest();
       } else if ('update' in command) {
         const { path: filePath, content } = command.update;
-        console.log(`UPDATE ${filePath}`);
+        process.stdout.write(`UPDATE ${filePath}\n`);
         if(typeof(content) !== 'string') {
           console.error(`Claude returned unexpected file content: ${JSON.stringify(command.update)}`)
         }
@@ -144,7 +150,7 @@ Respond with only the JSON array.`;
         }
       } else if ('remove' in command) {
         const { path: filePath } = command.remove;
-        console.log(`REMOVE ${filePath}`);
+        process.stdout.write(`REMOVE ${filePath}\n`);
         await fs.unlink(filePath);
         
         const file = this.manifest.files.find(f => f.path === filePath);
@@ -153,49 +159,69 @@ Respond with only the JSON array.`;
           await this.saveManifest();
         }
       } else if ('finish' in command) {
-        console.log('\nGeneration complete!');
-        console.log(command.finish);
+        process.stdout.write('\nGeneration complete!\n');
+        process.stdout.write(command.finish);
         return true;
       }
     }
     return false;
   }
 
+  preload(): Promise<Anthropic.Messages.MessageParam[]> {
+    return Promise.all(this.specContent.map((clause: string|object) => {
+      if(typeof(clause) === 'string') return Promise.resolve({ role: 'user', content: clause });
+      if('import' in clause && typeof(clause.import) === 'string') {
+        return fs.readFile(clause.import).then(buffer => ({
+          role: 'user', content: buffer.toString('base64')
+        }))
+      }
+    }));
+  }
+  
   async generate() {
     let finished = false;
-
+    let errors: string[] = [];
+    
     while (!finished) {
-      const message = `Project specification:
-${JSON.stringify(this.specContent, null, 2)}
-
-Current manifest:
-${JSON.stringify(this.manifest, null, 2)}
-
-Please continue generating source files, skipping any that are already marked as generated.
-Respond with a JSON array of command objects with one of these formats:
-
-ADD: { "add": { "path": "file path", "description": "file description" } }
-UPDATE: { "update": { "path": "file path", "content": "file contents", "why": "reason for update" } }
-REMOVE: { "remove": { "path": "file path" } }
-FINISH: { "finish": "final report" }
-
-Generate only files that haven't been generated yet. Include file contents in UPDATE commands.
-Respond with only the JSON array of commands.`;
-
+      const preloads = await this.preload();
       try {
+        const fixes = errors.map<Anthropic.Messages.MessageParam>(error => ({ role: 'user', content: `Be sure to fix this error: ${error}` }));
         const response = await anthropic.messages.create({
           model: 'claude-3-opus-20240229',
           max_tokens: 4096,
-          messages: [{ role: 'user', content: message }],
+          messages: [...preloads, { role: 'user', content: `
+Current manifest:
+${JSON.stringify(this.manifest, null, 2)}
+
+Your next response must be entirely in well-formed JSON format.
+
+Continue generating project files. Start by picking just one file to generate (or update). Skip any that are already marked in the manifest as generated.` }, 
+          ...fixes, { role: 'user', content: `Organize your reponse as a queue of command objects:
+- If in order to comlpete the project, you need to add a file to the manifest, then queue an ADD command with format: { add: { path: 'path of file to be added', description: 'description of the file to be added' } }
+- If in order to comlpete the project, you need to generate or update a file already listed as generated in the manifest, then queue an UPDATE command with format: { update: { path: 'path of file to be added', content: 'contents of generated file', why: 'reason why file is being updated' } }
+- If in order to comlpete the project, you need to remove a file already in the manifest, then queue a REMOVE command with format: { remove: { path: 'path of file to be added' } }
+- If in order to comlpete the project, you determine there are absolutely no more files to be added, updated, or removed, then queue a FINISH command with format: { finish: 'final report once no more files need to be added, updated, or removed' }
+
+Include file contents in UPDATE commands.
+
+Your response must not contain any FINISH command if you know there are more files to be added, updated, or removed.
+
+Respond with a JSON array of command objects (of type ADD, or UPDATE, or REMOVE, or FINISH) with one the specific formats described above.
+
+Your response must contain only the JSON array of commands, with no formatting or additional explanation.` }]
         });
 
         const content = response.content[0].text;
-        console.log(`RESPONSE: ${content}`);
         const commands: Command[] = JSON.parse(content);
         finished = await this.processCommands(commands);
       } catch (error) {
-        console.error('Error during generation:', error);
-        process.exit(1);
+        if(errors.length > 0) {
+          console.error('Failure:', [ ...errors, error ]);
+          process.exit(1);
+        } else {
+          console.log(error);
+          errors = `${error}`.split('\n');
+        }
       }
     }
   }
